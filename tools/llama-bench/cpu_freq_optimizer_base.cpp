@@ -33,7 +33,6 @@ class CpuFreqOptimizerBase {
         step_(0),
         energyBaseline_(std::numeric_limits<double>::quiet_NaN()),
         timeBaseline_(std::numeric_limits<double>::quiet_NaN()),
-        cacheMaxTempC_(std::numeric_limits<double>::quiet_NaN()),
         currentCfg_{ 0, 0 },
         // 温度相关：默认关闭
         thermalEnabled_(false),
@@ -103,66 +102,39 @@ class CpuFreqOptimizerBase {
 
     // energies / latencies：本窗口内所有请求的样本
     // windowMaxTempC：本窗口内观测到的最大温度（℃），如果没有温度就传 NaN
-    void postBatch(const std::vector<double> & energies, const std::vector<double> & latencies, double windowMaxTempC) {
-        if (energies.size() != latencies.size()) {
-            throw std::runtime_error("energies and latencies size mismatch");
-        }
-
-        cacheEnergy_.insert(cacheEnergy_.end(), energies.begin(), energies.end());
-        cacheTime_.insert(cacheTime_.end(), latencies.begin(), latencies.end());
-
+    void postBatch(double windowEnergy, const std::vector<double> & latencies, double windowMaxTempC) {
+        const double meanT = mean(latencies.begin(), latencies.end());
         // 记录当前窗口内的最大温度
-        if (std::isnan(cacheMaxTempC_)) {
-            cacheMaxTempC_ = windowMaxTempC;
-        } else if (!std::isnan(windowMaxTempC)) {
-            cacheMaxTempC_ = std::max(cacheMaxTempC_, windowMaxTempC);
-        }
+        std::cout << "[OPT] ---- step " << step_ << " update begin, freqIdx=" << currentCfg_.freqIdx << " ("
+                  << freqLevels_[currentCfg_.freqIdx] << " kHz)"
+                  << ", threadIdx=" << currentCfg_.threadIdx << " (n=" << threadLevels_[currentCfg_.threadIdx] << ")"
+                  << ", samples=" << latencies.size() << ", windowEnergy=" << windowEnergy
+                  << ", maxTemp=" << windowMaxTempC << " C ----" << std::endl;
 
-        // 样本够一个 window 了（比如 10 次请求）
-        if (cacheEnergy_.size() >= cacheLength_) {
-            std::cout << "[OPT] ---- step " << step_ << " update begin, freqIdx=" << currentCfg_.freqIdx << " ("
-                      << freqLevels_[currentCfg_.freqIdx] << " kHz)"
-                      << ", threadIdx=" << currentCfg_.threadIdx << " (n=" << threadLevels_[currentCfg_.threadIdx]
-                      << ")"
-                      << ", samples=" << cacheEnergy_.size() << ", maxTemp=" << cacheMaxTempC_ << " C ----"
-                      << std::endl;
+        updateHistory(windowEnergy, meanT, windowMaxTempC);
 
-            updateHistory(cacheMaxTempC_);
+        CpuFreqConfig best     = bestConfigGlobal();
+        double        bestCost = costOf(best.freqIdx, best.threadIdx);
 
-            CpuFreqConfig best     = bestConfigGlobal();
-            double        bestCost = costOf(best.freqIdx, best.threadIdx);
+        std::cout << "[OPT] after step " << step_ << " best=(freqIdx=" << best.freqIdx << ", "
+                  << freqLevels_[best.freqIdx] << " kHz"
+                  << "; threadIdx=" << best.threadIdx << ", n=" << threadLevels_[best.threadIdx] << ")"
+                  << " bestCost=" << bestCost << std::endl;
 
-            std::cout << "[OPT] after step " << step_ << " best=(freqIdx=" << best.freqIdx << ", "
-                      << freqLevels_[best.freqIdx] << " kHz"
-                      << "; threadIdx=" << best.threadIdx << ", n=" << threadLevels_[best.threadIdx] << ")"
-                      << " bestCost=" << bestCost << std::endl;
+        // 子类决定下一轮配置
+        chooseNextConfig();
 
-            // 子类决定下一轮配置
-            chooseNextConfig();
-
-            ++step_;
-        }
+        ++step_;
     }
 
     // 兼容旧代码：不带温度（相当于 windowMaxTempC=NaN → 无温度惩罚）
-    void postBatch(const std::vector<double> & energies, const std::vector<double> & latencies) {
-        postBatch(energies, latencies, std::numeric_limits<double>::quiet_NaN());
-    }
 
   protected:
     // 子类需要实现：决定下一次用哪个 (freq, threads)
     virtual void chooseNextConfig() = 0;
 
     // 默认的 history 更新：支持温度惩罚
-    virtual void updateHistory(double windowMaxTempC) {
-        if (cacheEnergy_.empty()) {
-            std::cout << "[OPT] updateHistory: empty cache, skip" << std::endl;
-            return;
-        }
-
-        const double meanE = mean(cacheEnergy_.begin(), cacheEnergy_.end());
-        const double meanT = mean(cacheTime_.begin(), cacheTime_.end());
-
+    virtual void updateHistory(double meanE, double meanT, double windowMaxTempC) {
         // 如果还没有 baseline，就用当前 step 的均值初始化一次
         if (std::isnan(energyBaseline_) || std::isnan(timeBaseline_)) {
             energyBaseline_ = meanE;
@@ -199,18 +171,12 @@ class CpuFreqOptimizerBase {
                   << " totalCost=" << totalCost << std::endl;
         // ★★★★★ 调用子类 hook
         onNewCost(currentCfg_.freqIdx, currentCfg_.threadIdx, totalCost);
-        cacheEnergy_.clear();
-        cacheTime_.clear();
-        cacheMaxTempC_ = std::numeric_limits<double>::quiet_NaN();
     }
 
     // 新增：默认空实现，子类可以根据需要 override
     virtual void onNewCost(int /*fIdx*/, int /*tIdx*/, double /*effCost*/) {
         // 默认啥也不干
     }
-
-    // 兼容老签名：不带温度
-    virtual void updateHistory() { updateHistory(std::numeric_limits<double>::quiet_NaN()); }
 
     template <typename It> static double mean(It first, It last) {
         const auto n = std::distance(first, last);
@@ -302,11 +268,6 @@ class CpuFreqOptimizerBase {
     // -------- baseline --------
     double energyBaseline_;
     double timeBaseline_;
-
-    // -------- 当前 window 的原始样本缓存 --------
-    std::vector<double> cacheEnergy_;
-    std::vector<double> cacheTime_;
-    double              cacheMaxTempC_;
 
     // -------- 历史 cost --------
     // 2D (freq, threads) 压成 1D 存

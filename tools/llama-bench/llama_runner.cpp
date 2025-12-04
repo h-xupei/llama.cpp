@@ -52,7 +52,7 @@ static bool run_prefill(llama_context * ctx, int n_prompt, int n_batch, int n_th
 // ================== 一次请求的指标结构 ==================
 
 struct LlamaRunMetrics {
-    double energy;           // 本次请求能耗 (E_after - E_before)，单位 mJ（当前伪实现）
+//    double energy;           // 本次请求能耗 (E_after - E_before)，单位 mJ（当前伪实现）
     double total_latency_s;  // 总延迟：从请求开始到最后一个生成 token 完成
     double ftl_s;            // First Token Latency：请求开始 -> 第一个生成 token 完成
     double steady_ts;        // 稳态 token/s（第二个生成 token 到最后一个）
@@ -246,7 +246,7 @@ LlamaRunMetrics LlamaRunner::run_one_request(int n_prompt_tokens, int n_gen_toke
     // ===== 5. 指标汇总 =====
     LlamaRunMetrics m{};
 
-    m.energy          = E_after - E_before;
+//    m.energy          = E_after - E_before;
     m.total_latency_s = (t_last_token_end - t_start) * 1e-9;   // 总延迟
     m.ftl_s           = (t_first_token_end - t_start) * 1e-9;  // FTL
 

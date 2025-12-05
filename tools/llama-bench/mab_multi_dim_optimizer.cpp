@@ -28,7 +28,7 @@ class MABMultiDimCpuFreqOptimizer : public CpuFreqOptimizerBase {
         CpuFreqOptimizerBase(alpha, freqLevels, threadLevels, cacheLength),
         expAvgAlpha_(expAvgAlpha),
         exploitProb_(exploitProb),
-        hotStart_(hotStart),
+        hotStart_(std::min(static_cast<int>(cacheLength), hotStart)),  // 取最小值
         orderOffsetInitialized_(false) {
         // 维度顺序：默认 [FREQ, THREAD]
         if (orderDims.empty()) {

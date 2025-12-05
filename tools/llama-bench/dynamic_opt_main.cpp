@@ -11,8 +11,14 @@
 #include "neighbor_search_optimizer.cpp"
 #include "power_sample.cpp"
 
+#include <fcntl.h>   // open, O_WRONLY, O_CLOEXEC
+#include <unistd.h>  // write, close
+
+#include <cerrno>    // errno
 #include <chrono>
-#include <cstdio>  // fprintf, stderr
+#include <cstdint>   // uint64_t
+#include <cstdio>    // fprintf, stderr
+#include <cstring>   // strerror
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -21,12 +27,15 @@
 #include <string>
 #include <vector>
 
+// =================== 小工具：时间戳 ===================
+
 static inline uint64_t lr_now_ns() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count();
 }
 
 // ============== 简单 helper：算平均值 ==============
+
 static double mean(const std::vector<double> & v) {
     if (v.empty()) {
         return 0.0;
@@ -34,6 +43,8 @@ static double mean(const std::vector<double> & v) {
     double sum = std::accumulate(v.begin(), v.end(), 0.0);
     return sum / static_cast<double>(v.size());
 }
+
+// =================== 一些 sysfs 读写工具 ===================
 
 // 读整个文件为字符串
 static inline bool read_str(const char * path, std::string & out) {
@@ -62,6 +73,7 @@ static inline bool read_ll(const char * path, long long & out) {
     return false;
 }
 
+// 写 long long
 static inline bool write_ll(const char * path, long long v) {
     std::ofstream f(path);
     if (!f.good()) {
@@ -71,6 +83,7 @@ static inline bool write_ll(const char * path, long long v) {
     return !f.fail();
 }
 
+// 读取某个 policy 的 scaling_available_frequencies
 static inline std::vector<int> read_available_freqs(int policy) {
     std::vector<int> v;
     std::string      s;
@@ -87,13 +100,15 @@ static inline std::vector<int> read_available_freqs(int policy) {
     return v;
 }
 
-// ============== 占位：实际设置 CPU 频点 ==============
+// ============== 实际设置 CPU 频点（可按需替换） ==============
+// 这里用的是“锁 min/max 到同一个频率”的方式，你之前已经在用这套逻辑
+
 static bool apply_cpu_freq_khz(int policy, int f) {
-    // TODO: 用你真机上的 DVFS 控制逻辑替换
-    std::cout << "[DVFS] set CPU freq to " << f << " kHz" << std::endl;
+    std::cout << "[DVFS] set CPU policy" << policy << " freq to " << f << " kHz\n";
     if (f < 0) {
-        return true;  // -1 表示不改
+        return true;  // -1 表示“不改频率”
     }
+
     std::string base     = "/sys/devices/system/cpu/cpufreq/policy" + std::to_string(policy);
     std::string path_min = base + "/scaling_min_freq";
     std::string path_max = base + "/scaling_max_freq";
@@ -103,7 +118,11 @@ static bool apply_cpu_freq_khz(int policy, int f) {
     (void) read_ll(path_max.c_str(), cur_max);
 
     bool ok1 = false, ok2 = false;
-    if (f < cur_min) {
+    if (cur_min < 0 || cur_max < 0) {
+        // 读失败了就直接尝试写
+        ok1 = write_ll(path_min.c_str(), f);
+        ok2 = write_ll(path_max.c_str(), f);
+    } else if (f < cur_min) {
         ok1 = write_ll(path_min.c_str(), f);
         ok2 = write_ll(path_max.c_str(), f);
     } else {
@@ -111,9 +130,10 @@ static bool apply_cpu_freq_khz(int policy, int f) {
         ok1 = write_ll(path_min.c_str(), f);
     }
 
-    // 若存在 setspeed，尝试一下（通常需 userspace governor，但不强制切换）
-    // if (file_exists((base + "/scaling_setspeed").c_str())) {
-    //     (void) write_ll((base + "/scaling_setspeed").c_str(), f);
+    // 若存在 setspeed，可按需再试一次（通常需要 userspace governor）
+    // std::string setspeed = base + "/scaling_setspeed";
+    // if (file_exists(setspeed.c_str())) {
+    //     (void) write_ll(setspeed.c_str(), f);
     // }
 
     if (!ok1 || !ok2) {
@@ -122,17 +142,17 @@ static bool apply_cpu_freq_khz(int policy, int f) {
     return ok1 && ok2;
 }
 
-// 读取当前真实 CPU 频率（示例：policy4）
+// 读取当前真实 CPU 频率（例如 policy4）
 static int read_current_cpu_freq_khz() {
     long long v  = 0;
     bool      ok = read_ll("/sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq", v);
-    if (!ok) {
-        // 读取失败时给个占位值，便于后期分析看出来
-        return -1;
+    if (!ok || v <= 0) {
+        return -1;  // 读取失败，用 -1 作为占位
     }
     return (int) v;
 }
 
+// llama 日志回调：静音
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) text;
@@ -154,13 +174,11 @@ static void ensure_window_csv_opened(const std::string & path) {
     {
         std::ifstream fin(path, std::ios::in | std::ios::ate);
         if (!fin.is_open()) {
-            // 文件不存在 ⇒ 需要写表头
-            needHeader = true;
+            needHeader = true;  // 文件不存在
         } else {
             auto size = fin.tellg();
             if (size <= 0) {
-                // 空文件 ⇒ 需要写表头
-                needHeader = true;
+                needHeader = true;  // 空文件
             }
         }
     }
@@ -182,7 +200,7 @@ static void ensure_window_csv_opened(const std::string & path) {
                     << "real_freq_khz,"
                     << "n_threads,"
                     << "samples,"
-                    << "avg_energy_mJ,"
+                    << "avg_energy_mJ,"  // 这里写的是“窗口能量 mJ”，命名沿用之前
                     << "avg_steady_lat_s_per_token,"
                     << "avg_total_lat_s,"
                     << "avg_ftl_s,"
@@ -195,7 +213,8 @@ static void ensure_window_csv_opened(const std::string & path) {
     g_windowCsvInited = true;
 }
 
-// ============== 工厂方法：根据 algo_flag 创建优化器，并设置 algo_name ==============
+// ============== 工厂方法：根据 algo_flag 创建优化器 ==============
+// algo_flag 支持： "dvfs" / "grid" / "linear" / "neighbor" / "bayes" / "mab"
 
 static std::unique_ptr<CpuFreqOptimizerBase> create_optimizer(const std::string &      algo_flag,
                                                               double                   alpha,
@@ -203,7 +222,12 @@ static std::unique_ptr<CpuFreqOptimizerBase> create_optimizer(const std::string 
                                                               const std::vector<int> & threadLevels,
                                                               size_t                   samplesPerWindow,
                                                               const char *&            algo_name_out) {
-    // 注意：这里不做复杂的参数解析，只按字符串精确匹配
+    if (algo_flag == "dvfs") {
+        // 系统 DVFS 基线：不创建优化器（nullptr），在 main 里特殊处理
+        algo_name_out = "DVFS_system";
+        return nullptr;
+    }
+
     if (algo_flag == "grid") {
         algo_name_out = "GridSearch";
         return std::make_unique<GridSearchCpuFreqOptimizer>(alpha, freqLevelsKHz, threadLevels, samplesPerWindow);
@@ -229,9 +253,29 @@ static std::unique_ptr<CpuFreqOptimizerBase> create_optimizer(const std::string 
     return std::make_unique<MABMultiDimCpuFreqOptimizer>(alpha, freqLevelsKHz, threadLevels, samplesPerWindow);
 }
 
-// ============== 主流程：只有“真实窗口”，每窗口结束调一次优化器 ==============
+static bool write_wakelock(const char * path, const char * name) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror("open");
+        return false;
+    }
+    char buf[128];
+    int  n = snprintf(buf, sizeof(buf), "%s\n", name);
+    if (write(fd, buf, n) != n) {
+        perror("write");
+        close(fd);
+        return false;
+    }
+    close(fd);
+    return true;
+}
+
+// ============== 主流程：真实窗口 + 在线优化/基线 ==============
 
 int main(int argc, char ** argv) {
+    if (!write_wakelock("/sys/power/wake_lock", "llmbench")) {
+        std::fprintf(stderr, "acquire wakelock failed (need root/SELinux permissive)\n");
+    }
     llama_log_set(llama_null_log_callback, nullptr);
 
     // -------- 1. 基础初始化（一次性） --------
@@ -239,12 +283,17 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
 
-    // 模型路径，可以从命令行传，也可以写死
+    // 模型路径：argv[1]，算法标志：argv[2]
     std::string model_path = "/data/local/tmp/cpp/Qwen3-0.6B-Q4_0.gguf";
     if (argc > 1) {
-        // 保持之前行为：argv[1] 是模型路径，其它参数忽略
         model_path = argv[1];
     }
+
+    std::string algo_flag = "grid";  // 默认 grid
+    if (argc > 2) {
+        algo_flag = argv[2];         // "dvfs" / "grid" / "linear" / "neighbor" / "bayes" / "mab"
+    }
+    std::cout << "[MAIN] model_path = " << model_path << ", algo_flag = " << algo_flag << std::endl;
 
     // -------- 2. 创建 LlamaRunner --------
     const int n_ctx        = 512;  // 至少 >= 64 + 32
@@ -253,11 +302,11 @@ int main(int argc, char ** argv) {
 
     LlamaRunner runner(model_path, n_ctx, n_batch, init_threads);
 
-    // -------- 3. 定义可选的 CPU 频率档位 --------
+    // -------- 3. 定义可选的 CPU 频率档位（policy4） --------
     std::vector<int> freqLevelsKHz = read_available_freqs(4);
     if (freqLevelsKHz.size() >= 8) {
+        // 保留最高的几个频点，防止空间过大
         freqLevelsKHz.erase(freqLevelsKHz.begin(), freqLevelsKHz.end() - 8);
-        // 现在 freqLevelsKHz 只包含后8个元素
     }
     if (freqLevelsKHz.empty()) {
         std::cerr << "[WARN] scaling_available_frequencies empty for policy4, "
@@ -266,58 +315,98 @@ int main(int argc, char ** argv) {
     }
 
     // -------- 3.1 定义可选的线程数档位 --------
-    std::vector<int> threadLevels = { 1, 2, 3 };
-
+    std::vector<int> threadLevels       = { 1, 2, 3 };
+    const int        MAX_WINDOWS        = 50;  // 真实窗口总数
     // 每一“窗口”用多少次推理样本进行统计
-    const size_t SAMPLES_PER_WINDOW = 10;
+    const size_t     SAMPLES_PER_WINDOW = 5;
 
     // 代价函数权重 alpha：J = alpha * E_norm + (1-alpha) * T_norm
     const double alpha = 0.5;
 
     // -------- 4. 创建优化器（通过工厂方法） --------
-    // 这里简单用一个字符串切换算法，后续要换算法只改 algo_flag 即可：
-    // 可选："grid" / "linear" / "neighbor" / "bayes" / "mab"
-    std::string  algo_flag = "grid";  // 当前用 GridSearch，如果要改 MAB，就写 "mab"
     const char * algo_name = nullptr;
     auto optimizer = create_optimizer(algo_flag, alpha, freqLevelsKHz, threadLevels, SAMPLES_PER_WINDOW, algo_name);
+
+    std::cout << "[MAIN] algo_name = " << (algo_name ? algo_name : "UNKNOWN") << std::endl;
+
+    // -------- 5. 创建功耗采样器 --------
     PowerSampler sampler(
         /*period_ms=*/50,
         /*base=*/"/sys/class/power_supply/battery",
         /*tz_path=*/"/sys/class/thermal/thermal_zone37/temp",
-        /*log_path=*/""  // 或者 ""
+        /*log_path=*/""  // 不单独落盘 trace，窗口内 snapshot 即可
     );
-    // 打开 CSV（用绝对路径，避免当前工作目录不是 /data/local/tmp/cpp）
+
+    // -------- 6. 打开 CSV --------
     ensure_window_csv_opened("/data/local/tmp/cpp/window_metrics.csv");
 
-    // -------- 5. 主循环：真实请求 + 每窗口调一次优化器 --------
-    const int MAX_WINDOWS = 100;  // 真实窗口总数，随便写个上限
+    // -------- 7. 主循环：真实请求 + 每窗口调一次优化器/记录 DVFS --------
+
     sampler.start();
+
     for (int w = 0; w < MAX_WINDOWS; ++w) {
-        // 当前窗口配置：由优化器给出
-        CpuFreqConfig cfg = optimizer->currentConfig();
+        // ★ 记录窗口开始时的系统时间
+        auto wall_now = std::chrono::system_clock::now();
+        auto wall_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(wall_now.time_since_epoch()).count();
 
-        int curFreqKHz = freqLevelsKHz[cfg.freqIdx];
-        int curThreads = threadLevels[cfg.threadIdx];
+        // 格式化成本地可读时间 "YYYY-MM-DD HH:MM:SS"
+        std::time_t tt      = std::chrono::system_clock::to_time_t(wall_now);
+        char        buf[32] = { 0 };
+        std::tm     tm_local;
+        // Android / bionic 支持 localtime_r
+        localtime_r(&tt, &tm_local);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_local);
+        std::string wall_str(buf);
 
-        std::cout << "\n==================== WINDOW " << w << " : freqIdx=" << cfg.freqIdx << " (" << curFreqKHz
-                  << " kHz)"
-                  << ", threadIdx=" << cfg.threadIdx << " (n=" << curThreads << ")"
-                  << " ====================\n";
+        int curFreqKHz = -1;
+        int curThreads = 0;
+        int freqIdx    = -1;
+        int threadIdx  = -1;
+
+        if (optimizer) {
+            // 动态优化算法：由优化器给出当前配置
+            CpuFreqConfig cfg = optimizer->currentConfig();
+            freqIdx           = cfg.freqIdx;
+            threadIdx         = cfg.threadIdx;
+            curFreqKHz        = freqLevelsKHz[freqIdx];
+            curThreads        = threadLevels[threadIdx];
+        } else {
+            // DVFS 基线：不主动控频，只设定一个固定线程数（比如 4）
+            freqIdx    = -1;
+            threadIdx  = -1;
+            curFreqKHz = -1;  // target_freq 无意义
+            int size   = sizeof(threadLevels) / sizeof(threadLevels[0]);
+            curThreads = threadLevels[size - 1];
+        }
+
+        std::cout << "\n==================== WINDOW " << w;
+        if (optimizer) {
+            std::cout << " : freqIdx=" << freqIdx << " (" << curFreqKHz << " kHz)"
+                      << ", threadIdx=" << threadIdx << " (n=" << curThreads << ")";
+        } else {
+            std::cout << " : DVFS baseline, n_threads=" << curThreads;
+        }
+        std::cout << " ====================\n";
 
         // 下发 DVFS 配置 + 线程配置
-        apply_cpu_freq_khz(4, curFreqKHz);
-        runner.set_freq_ghz(curFreqKHz / 1e6);  // kHz -> GHz
+        if (optimizer) {
+            // 只有在线优化算法才写 sysfs 控频
+            apply_cpu_freq_khz(4, curFreqKHz);
+            runner.set_freq_ghz(curFreqKHz / 1e6);  // kHz -> GHz
+        } else {
+            // DVFS：完全交给系统 governor，不写任何频率节点
+            int realFreq = read_current_cpu_freq_khz();
+            runner.set_freq_ghz(realFreq > 0 ? realFreq / 1e6 : 0.0);
+        }
         runner.set_num_threads(curThreads);
 
         // 在当前配置下，跑 SAMPLES_PER_WINDOW 次 64+32 推理
-        std::vector<double> energies;
         std::vector<double> steady_lats;  // 稳态 s/token
         std::vector<double> total_lats;   // 总延迟
         std::vector<double> ftls;         // first token latency
         std::vector<double> overall_tps;  // overall tok/s
         std::vector<double> steady_tps;   // steady tok/s
 
-        energies.reserve(SAMPLES_PER_WINDOW);
         steady_lats.reserve(SAMPLES_PER_WINDOW);
         total_lats.reserve(SAMPLES_PER_WINDOW);
         ftls.reserve(SAMPLES_PER_WINDOW);
@@ -325,6 +414,7 @@ int main(int argc, char ** argv) {
         steady_tps.reserve(SAMPLES_PER_WINDOW);
 
         uint64_t t_win_start = lr_now_ns();
+
         for (size_t i = 0; i < SAMPLES_PER_WINDOW; ++i) {
             auto m = runner.run_one_request(/*n_prompt=*/64, /*n_gen=*/32);
 
@@ -336,67 +426,73 @@ int main(int argc, char ** argv) {
 
             double steady_lat = 1.0 / m.steady_ts;  // s/token，越小越好
 
-                                                    //            energies.push_back(m.energy);
             steady_lats.push_back(steady_lat);
             total_lats.push_back(m.total_latency_s);
             ftls.push_back(m.ftl_s);
             overall_tps.push_back(m.overall_ts);
             steady_tps.push_back(m.steady_ts);
 
-            std::cout << "  sample "
-                      << i
-                      //                      << " : E=" << m.energy << " mJ"
-                      << ", total_lat=" << m.total_latency_s << " s"
+            std::cout << "  sample " << i << " : total_lat=" << m.total_latency_s << " s"
                       << " (FTL=" << m.ftl_s << " s, steady_ts=" << m.steady_ts << " tok/s"
                       << ", steady_lat=" << steady_lat << " s/token)\n";
         }
-        uint64_t t_win_end     = lr_now_ns();
-        auto     snap          = sampler.snapshot();
-        double   win_mJ        = PowerSampler::integrate_mJ(snap, t_win_start, t_win_end);
-        double   max_temp_dC   = PowerSampler::max_temp_dC(snap, t_win_start, t_win_end);
-        double   maxTempC      = max_temp_dC / 10.0;  // deci-℃ -> ℃
-        double   avgE          = win_mJ;              // 每次请求平均能量（mJ / request）
-                                                      //        double avgE          = mean(energies);
-        double   avgSteadyLat  = mean(steady_lats);
-        double   avgTotalLat   = mean(total_lats);
-        double   avgFtl        = mean(ftls);
-        double   avgOverallTps = mean(overall_tps);
-        double   avgSteadyTps  = mean(steady_tps);
+
+        uint64_t t_win_end   = lr_now_ns();
+        auto     snap        = sampler.snapshot();
+        double   window_mJ   = PowerSampler::integrate_mJ(snap, t_win_start, t_win_end);
+        double   max_temp_dC = PowerSampler::max_temp_dC(snap, t_win_start, t_win_end);
+        double   maxTempC    = max_temp_dC / 10.0;  // deci-℃ -> ℃
+
+        double avgSteadyLat  = mean(steady_lats);
+        double avgTotalLat   = mean(total_lats);
+        double avgFtl        = mean(ftls);
+        double avgOverallTps = mean(overall_tps);
+        double avgSteadyTps  = mean(steady_tps);
 
         std::cout << "[WINDOW " << w << "] cfg=(" << curFreqKHz << " kHz, n=" << curThreads << "), "
-                  << "avgE=" << avgE << " mJ"
+                  << "windowEnergy=" << window_mJ << " mJ"
                   << ", avg_steady_lat=" << avgSteadyLat << " s/token"
                   << ", avg_total_lat=" << avgTotalLat << " s"
                   << ", avg_FTL=" << avgFtl << " s"
                   << ", avg_overall_ts=" << avgOverallTps << " tok/s"
-                  << ", avg_steady_ts=" << avgSteadyTps << " tok/s\n";
+                  << ", avg_steady_ts=" << avgSteadyTps << " tok/s"
+                  << ", maxTemp=" << maxTempC << " C\n";
 
         // 读取真实频率（可能与我们下发的 target 不一致）
         int realFreqKHz = read_current_cpu_freq_khz();
 
         // 记录优化器开销
-        auto tOptStart = std::chrono::steady_clock::now();
-        optimizer->postBatch(avgE, steady_lats, maxTempC);
-        auto   tOptEnd = std::chrono::steady_clock::now();
-        double optimizerMs =
-            std::chrono::duration_cast<std::chrono::microseconds>(tOptEnd - tOptStart).count() / 1000.0;
+        double optimizerMs    = 0.0;
         size_t numSamplesUsed = steady_lats.size();
 
-        std::cout << "[WINDOW " << w << "] optimizer_time_ms=" << optimizerMs << " (samples=" << numSamplesUsed
-                  << ")\n";
+        if (optimizer && numSamplesUsed > 0) {
+            auto tOptStart = std::chrono::steady_clock::now();
+            optimizer->postBatch(window_mJ, steady_lats, maxTempC);
+            auto tOptEnd = std::chrono::steady_clock::now();
+            optimizerMs  = std::chrono::duration_cast<std::chrono::microseconds>(tOptEnd - tOptStart).count() / 1000.0;
+
+            // 修正后的输出
+            std::cout << "[WINDOW " << w << "] algo_name=" << algo_name << " optimizer_time_ms=" << optimizerMs
+                      << " samples=" << numSamplesUsed << " realFreqKHz=" << realFreqKHz << std::endl;
+        } else {
+            std::cout << "[WINDOW " << w << "] DVFS baseline (no optimizer)"
+                      << " samples=" << numSamplesUsed << " realFreqKHz=" << realFreqKHz << std::endl;
+        }
 
         // 写入 CSV（window_metrics.csv）
         if (g_windowCsv.is_open()) {
             g_windowCsv << w << ","                                    // window_id
+                        << wall_str << ","                             // ★ 可读时间
+                        << wall_ms << ","                              // ★ Unix ms
                         << (algo_name ? algo_name : "UNKNOWN") << ","  // algo_name
                         << alpha << ","                                // alpha
-                        << cfg.freqIdx << ","                          // freq_idx
-                        << cfg.threadIdx << ","                        // thread_idx
-                        << curFreqKHz << ","                           // target_freq_khz
+                        << freqIdx << ","                              // freq_idx（DVFS 下为 -1）
+                        << threadIdx << ","                            // thread_idx（DVFS 下为 -1）
+                        << curFreqKHz << ","                           // target_freq_khz（DVFS 下为 -1）
                         << realFreqKHz << ","                          // real_freq_khz
                         << curThreads << ","                           // n_threads
                         << numSamplesUsed << ","                       // samples
-                        << avgE << ","                                 // avg_energy_mJ
+                        << window_mJ << ","                            // avg_energy_mJ（这里实为 windowEnergy）
                         << avgSteadyLat << ","                         // avg_steady_lat_s_per_token
                         << avgTotalLat << ","                          // avg_total_lat_s
                         << avgFtl << ","                               // avg_ftl_s
@@ -407,14 +503,21 @@ int main(int argc, char ** argv) {
             g_windowCsv.flush();
         }
 
-        // 下一窗口开始时，直接用 optimizer->currentConfig() 拿新配置即可
+        // 下一窗口开始时，动态算法直接用 optimizer->currentConfig() 拿新配置；
+        // DVFS 模式则继续走系统自带 governor。
     }
+
     sampler.stop();
-    // -------- 6. 收尾 --------
+
+    // -------- 8. 收尾 --------
     if (g_windowCsv.is_open()) {
         g_windowCsv.close();
     }
 
     llama_backend_free();
+    if (!write_wakelock("/sys/power/wake_unlock", "llmbench")) {
+        fprintf(stderr, "return wakelock failed (need root/SELinux permissive)\n");
+    }
+
     return 0;
 }

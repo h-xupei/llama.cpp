@@ -219,6 +219,74 @@ class PowerSampler {
         return buf_;
     }
 
+    // ===== 虚假功率和能量函数（基于频率、线程数和窗口时间） =====
+
+    /**
+ * 计算虚假平均功率，基于CPU频率和线程数
+ *
+ * 函数形式：P_fake(f, n) = 4000 × (f/2.4192)^0.8 × (n/3)^0.7 × (1 + 0.3×(1 - f/2.4192))
+ *
+ * 这个函数模拟的物理现象：
+ *   1. 频率越高，功率越大（正相关，指数0.8）
+ *   2. 线程数越多，功率越大（正相关，指数0.7）
+ *   3. 在低频时，由于效率下降，有额外的功率惩罚（+30%）
+ *
+ * @param f_khz CPU频率，单位kHz
+ * @param n_threads 线程数 (1, 2, 3)
+ * @return 虚假平均功率，单位mW
+ */
+    static double fake_power_mW(double f_khz, int n_threads) {
+        if (f_khz <= 0.0 || n_threads <= 0) {
+            return 0.0;
+        }
+
+        double f_ghz = f_khz / 1e6;
+
+        const double P_static = 800.0;   // 静态 + 其它模块底噪 (mW)
+        const double P_max    = 3200.0;  // 纯动态功耗在最高档时的增量 (mW)
+        const double f_max    = 2.4192;  // GHz
+        const double n_max    = 3.0;
+        const double gamma    = 0.8;
+        const double delta    = 0.7;
+        const double alpha    = 0.3;
+
+        double f_norm = std::clamp(f_ghz / f_max, 0.01, 1.0);
+        double n_norm = std::clamp((double)n_threads / n_max, 0.01, 1.0);
+
+        double dyn = P_max
+                     * std::pow(f_norm, gamma)
+                     * std::pow(n_norm, delta)
+                     * (1.0 + alpha * (1.0 - f_norm));
+
+        return P_static + dyn;
+    }
+
+
+    /**
+ * 计算虚假总能量，基于功率和窗口时间
+ *
+ * 能量 = 功率 × 时间 × 1000 (mW × s → mJ)
+ *
+ * @param f_khz CPU频率，单位kHz
+ * @param n_threads 线程数 (1, 2, 3)
+ * @param window_time_s 窗口持续时间，单位秒
+ * @return 虚假总能量，单位mJ
+ */
+    static double fake_energy_mJ(double f_khz, int n_threads, double window_time_s) {
+        if (window_time_s <= 0.0) {
+            return 0.0;
+        }
+
+        // 计算平均功率
+        double avg_power_mW = fake_power_mW(f_khz, n_threads);
+
+        // 能量 = 功率 × 时间 × 1000 (转换为mJ)
+        // 注意：1 mW × 1 s = 1 mJ
+        double energy_mJ = avg_power_mW * window_time_s;
+
+        return energy_mJ;
+    }
+
     // ===== 静态分析函数：积分能量 / 平均功率 / 温度等 =====
 
     // 对 [t0, t1] 上的功率曲线做梯形积分，返回能量 (mJ)
@@ -247,6 +315,23 @@ class PowerSampler {
             mJ += 0.5 * (Pa + Pb) * dt_s;
         }
         return mJ;
+    }
+
+    static double first_power_after(const std::vector<power_sample> & s, uint64_t t0) {
+        if (s.empty()) {
+            return 0.0;
+        }
+
+        for (const auto & x : s) {
+            if (x.ts_ns < t0) {
+                continue;
+            }
+            if (x.temp_dC < 0) {
+                continue;  // 无效温度
+            }
+            return static_cast<double>(x.mW);
+        }
+        return 0.0;
     }
 
     static double avg_mW(const std::vector<power_sample> & s, uint64_t t0, uint64_t t1) {
@@ -302,6 +387,25 @@ class PowerSampler {
             }
         }
         return mx < 0 ? 0.0 : (double) mx;
+    }
+
+    // 返回 t0 之后（含 t0）的第一个有效温度，单位：deci-℃（0.1℃）
+    // 如果找不到有效温度，返回 0.0
+    static double first_temp_dC_after(const std::vector<power_sample> & s, uint64_t t0) {
+        if (s.empty()) {
+            return 0.0;
+        }
+
+        for (const auto & x : s) {
+            if (x.ts_ns < t0) {
+                continue;
+            }
+            if (x.temp_dC < 0) {
+                continue;  // 无效温度
+            }
+            return static_cast<double>(x.temp_dC);
+        }
+        return 0.0;
     }
 
     static void dump_csv(const std::vector<power_sample> & s, const std::string & path) {

@@ -37,8 +37,7 @@ class LinearSearchOptimizer : public CpuFreqOptimizerBase {
     void chooseNextConfig() override {
         if (finished_) {
             // 已经做完两轮 sweep：保持全局最优配置
-            CpuFreqConfig best = bestConfigGlobal();
-            setCurrentConfig(best.freqIdx, best.threadIdx);
+            setCurrentConfig(bestCfg_.freqIdx, bestCfg_.threadIdx);
             return;
         }
 
@@ -57,14 +56,14 @@ class LinearSearchOptimizer : public CpuFreqOptimizerBase {
         // 队列为空，说明当前维度的一次 sweep 跑完了，需要切换维度或收尾
         if (numSweepsDone_ >= 2) {
             // 2 个维度都扫完了：从整个 2D 空间中选最优
-            CpuFreqConfig best = bestConfigGlobal();
-            finished_          = true;
+            bestCfg_  = bestConfigGlobal();
+            finished_ = true;
 
-            std::cout << "[LIN] all sweeps done, global best cfg: freqIdx=" << best.freqIdx << " ("
-                      << freqLevels_[best.freqIdx] << " kHz), threadIdx=" << best.threadIdx
-                      << " (n=" << threadLevels_[best.threadIdx] << ")\n";
+            std::cout << "[LIN] all sweeps done, global best cfg: freqIdx=" << bestCfg_.freqIdx << " ("
+                      << freqLevels_[bestCfg_.freqIdx] << " kHz), threadIdx=" << bestCfg_.threadIdx
+                      << " (n=" << threadLevels_[bestCfg_.threadIdx] << ")\n";
 
-            setCurrentConfig(best.freqIdx, best.threadIdx);
+            setCurrentConfig(bestCfg_.freqIdx, bestCfg_.threadIdx);
             return;
         }
 
@@ -127,4 +126,5 @@ class LinearSearchOptimizer : public CpuFreqOptimizerBase {
     bool                       finished_;         // 是否两维都扫完
     std::vector<CpuFreqConfig> sweepQueue_;       // 当前 sweep 的待测配置列表
     std::vector<CpuFreqConfig> lastSweepBackup_;  // 上一轮 sweep 的所有配置，用来选基准
+    CpuFreqConfig              bestCfg_;
 };

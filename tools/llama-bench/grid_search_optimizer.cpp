@@ -32,8 +32,8 @@ class GridSearchCpuFreqOptimizer : public CpuFreqOptimizerBase {
 
             CpuFreqConfig cur = currentConfig();
 
-            for (int f = 0; f < nFreq; ++f) {
-                for (int t = 0; t < nThread; ++t) {
+            for (int f = nFreq - 1; f >= 0; --f) {
+                for (int t = nThread - 1; t >= 0; --t) {
                     // 起点这格已经在当前窗口测过一次，可以选择跳过避免重复；也可以保留
                     if (f == cur.freqIdx && t == cur.threadIdx) {
                         continue;
@@ -61,27 +61,25 @@ class GridSearchCpuFreqOptimizer : public CpuFreqOptimizerBase {
 
         // 2）队列空了，说明所有组合都测完一次
         if (!gridFinished_) {
-            CpuFreqConfig best = bestConfigGlobal();
-            gridFinished_      = true;
+            bestCfg_      = bestConfigGlobal();
+            gridFinished_ = true;
 
-            std::cout << "[GRID] sweep finished, best cfg: freqIdx=" << best.freqIdx << " ("
-                      << freqLevels_[best.freqIdx] << " kHz), threadIdx=" << best.threadIdx
-                      << " (n=" << threadLevels_[best.threadIdx] << ")" << std::endl;
+            std::cout << "[GRID] sweep finished, best cfg: freqIdx=" << bestCfg_.freqIdx << " ("
+                      << freqLevels_[bestCfg_.freqIdx] << " kHz), threadIdx=" << bestCfg_.threadIdx
+                      << " (n=" << threadLevels_[bestCfg_.threadIdx] << ")" << std::endl;
 
             // 之后一直用这个全局最优配置
-            setCurrentConfig(best.freqIdx, best.threadIdx);
+            setCurrentConfig(bestCfg_.freqIdx, bestCfg_.threadIdx);
             return;
         }
 
         // 3）gridFinished_ == true：已经选出最优，后续每次都保持该配置
-        {
-            CpuFreqConfig best = bestConfigGlobal();
-            setCurrentConfig(best.freqIdx, best.threadIdx);
-        }
+        { setCurrentConfig(bestCfg_.freqIdx, bestCfg_.threadIdx); }
     }
 
   private:
     std::vector<CpuFreqConfig> sweepQueue_;
     bool                       gridInitialized_;
     bool                       gridFinished_;
+    CpuFreqConfig              bestCfg_;
 };

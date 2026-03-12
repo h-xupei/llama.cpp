@@ -11,10 +11,10 @@
 #include <vector>
 
 // ================== 小工具函数：时间戳 ==================
-
+// 必须与 PowerSampler 保持同一时钟体系：steady_clock
 static uint64_t get_time_ns() {
-    using clock = std::chrono::high_resolution_clock;
-    return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count();
 }
 
 // ================== 小工具函数：预填充 ==================
@@ -52,11 +52,14 @@ static bool run_prefill(llama_context * ctx, int n_prompt, int n_batch, int n_th
 // ================== 一次请求的指标结构 ==================
 
 struct LlamaRunMetrics {
-//    double energy;           // 本次请求能耗 (E_after - E_before)，单位 mJ（当前伪实现）
-    double total_latency_s;  // 总延迟：从请求开始到最后一个生成 token 完成
-    double ftl_s;            // First Token Latency：请求开始 -> 第一个生成 token 完成
-    double steady_ts;        // 稳态 token/s（第二个生成 token 到最后一个）
-    double overall_ts;       // 整体 token/s（含 prompt + gen）
+    //    double energy;           // 本次请求能耗 (E_after - E_before)，单位 mJ（当前伪实现）
+    double   total_latency_s;  // 总延迟：从请求开始到最后一个生成 token 完成
+    double   ftl_s;            // First Token Latency：请求开始 -> 第一个生成 token 完成
+    double   steady_ts;        // 稳态 token/s（第二个生成 token 到最后一个）
+    double   overall_ts;       // 整体 token/s（含 prompt + gen）
+                               // 新增：TG(decoding/generation)阶段的时间范围
+    uint64_t tg_start_ns = 0;  // prefill 完成后，开始进入 generation loop 的时间
+    uint64_t tg_end_ns   = 0;  // 最后一个生成 token 完成时间
 };
 
 // ================== LlamaRunner 定义 ==================
@@ -220,6 +223,7 @@ LlamaRunMetrics LlamaRunner::run_one_request(int n_prompt_tokens, int n_gen_toke
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
+    uint64_t t_tg_start        = t_prefill_done;
     uint64_t t_first_token_end = 0;
     uint64_t t_last_token_end  = 0;
 
@@ -246,9 +250,11 @@ LlamaRunMetrics LlamaRunner::run_one_request(int n_prompt_tokens, int n_gen_toke
     // ===== 5. 指标汇总 =====
     LlamaRunMetrics m{};
 
-//    m.energy          = E_after - E_before;
+    //    m.energy          = E_after - E_before;
     m.total_latency_s = (t_last_token_end - t_start) * 1e-9;   // 总延迟
     m.ftl_s           = (t_first_token_end - t_start) * 1e-9;  // FTL
+    m.tg_start_ns     = t_tg_start;
+    m.tg_end_ns       = t_last_token_end;
 
     int total_tokens = n_prompt_tokens + n_gen_tokens;
     m.overall_ts     = total_tokens / m.total_latency_s;  // 含 prompt + gen

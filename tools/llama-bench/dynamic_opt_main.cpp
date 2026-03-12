@@ -178,6 +178,11 @@ static void llama_null_log_callback(enum ggml_log_level level, const char * text
     (void) user_data;
 }
 
+struct TimeRangeNs {
+    uint64_t t0 = 0;
+    uint64_t t1 = 0;
+};
+
 // ============== CSV 全局句柄 ==============
 
 static std::ofstream g_windowCsv;
@@ -222,8 +227,12 @@ static void ensure_window_csv_opened(const std::string & path) {
                     << "samples,"
                     << "window_start_temp_c,"
                     << "window_max_temp_c,"
-                    << "avg_energy_mJ,"
-                    << "avg_fixed_mJ,"
+                    << "idle_avg_mW,"
+                    << "tg_time_s,"
+                    << "tg_energy_mJ,"
+                    << "tg_avg_power_mW,"
+                    << "dyn_avg_power_mW,"
+                    << "dyn_energy_mJ,"
                     << "avg_steady_lat_s_per_token,"
                     << "avg_total_lat_s,"
                     << "avg_ftl_s,"
@@ -382,10 +391,14 @@ static void run_static_for_algo(const std::string &      algo_flag,
         }
         runner.set_num_threads(curThreads);
         // 每个优化器预热一次请求
-        runner.run_one_request(/*n_prompt=*/64, /*n_gen=*/32);
+        runner.run_one_request(/*n_prompt=*/256, /*n_gen=*/128);
+        // ===== 先测 5s idle 平均功率 =====
+        uint64_t t_idle_start = lr_now_ns();
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        uint64_t t_idle_end = lr_now_ns();
         // 记录窗口开始时的系统时间
-        auto wall_now = std::chrono::system_clock::now();
-        auto wall_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(wall_now.time_since_epoch()).count();
+        auto     wall_now   = std::chrono::system_clock::now();
+        auto     wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall_now.time_since_epoch()).count();
 
         std::time_t tt      = std::chrono::system_clock::to_time_t(wall_now);
         char        buf[32] = { 0 };
@@ -394,17 +407,19 @@ static void run_static_for_algo(const std::string &      algo_flag,
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_local);
         std::string wall_str(buf);
 
-        std::vector<double> steady_lats;
-        std::vector<double> total_lats;
-        std::vector<double> ftls;
-        std::vector<double> overall_tps;
-        std::vector<double> steady_tps;
+        std::vector<double>      steady_lats;
+        std::vector<double>      total_lats;
+        std::vector<double>      ftls;
+        std::vector<double>      overall_tps;
+        std::vector<double>      steady_tps;
+        std::vector<TimeRangeNs> tg_ranges;
 
         steady_lats.reserve(SAMPLES_PER_WINDOW);
         total_lats.reserve(SAMPLES_PER_WINDOW);
         ftls.reserve(SAMPLES_PER_WINDOW);
         overall_tps.reserve(SAMPLES_PER_WINDOW);
         steady_tps.reserve(SAMPLES_PER_WINDOW);
+        tg_ranges.reserve(SAMPLES_PER_WINDOW);
 
         uint64_t t_win_start = lr_now_ns();
 
@@ -424,25 +439,42 @@ static void run_static_for_algo(const std::string &      algo_flag,
             ftls.push_back(m.ftl_s);
             overall_tps.push_back(m.overall_ts);
             steady_tps.push_back(m.steady_ts);
+            tg_ranges.push_back({ m.tg_start_ns, m.tg_end_ns });
 
             std::cout << "  sample " << i << " : total_lat=" << m.total_latency_s << " s"
                       << " (FTL=" << m.ftl_s << " s, steady_ts=" << m.steady_ts << " tok/s"
-                      << ", steady_lat=" << steady_lat << " s/token)\n";
+                      << ", steady_lat=" << steady_lat << " s/token)"
+                      << ", tg_dt=" << (m.tg_end_ns - m.tg_start_ns) * 1e-9 << " s)\n";
         }
         int realFreqKHz = read_current_cpu_freq_khz();
         runner.set_freq_ghz(realFreqKHz > 0 ? realFreqKHz / 1e6 : 0.0);
 
         uint64_t t_win_end   = lr_now_ns();
         auto     snap        = sampler.snapshot();
-        double   end_mJ      = PowerSampler::integrate_mJ(snap, t_win_start, t_win_end);
         double   max_temp_dC = PowerSampler::max_temp_dC(snap, t_win_start, t_win_end);
         double   maxTempC    = max_temp_dC / 10.0;
         double   startTempC  = PowerSampler::first_temp_dC_after(snap, t_win_start) / 10.0;
-        double   basePower   = PowerSampler::first_power_after(snap, t_win_start);
-        double   dt_s        = (double) (t_win_end - t_win_start) / 1e9;
-        double   start_mJ    = basePower * dt_s;
-        double   window_mJ   = end_mJ;
-        double   fixed_mJ    = PowerSampler::fake_energy_mJ(realFreqKHz, curThreads, dt_s);
+
+        double idle_avg_mW        = PowerSampler::avg_mW(snap, t_idle_start, t_idle_end);
+        // ===== TG 总时长 / 总能量 / 平均功率 =====
+        double tg_time_s_total    = 0.0;
+        double tg_energy_mJ_total = 0.0;
+
+        for (const auto & r : tg_ranges) {
+            if (r.t1 <= r.t0) {
+                continue;
+            }
+            tg_time_s_total += (double) (r.t1 - r.t0) / 1e9;
+            tg_energy_mJ_total += PowerSampler::integrate_mJ(snap, r.t0, r.t1);
+        }
+
+        double tg_avg_power_mW = (tg_time_s_total > 0.0) ? (tg_energy_mJ_total / tg_time_s_total) : 0.0;
+
+        // 动态功耗 = TG平均功率 - Idle平均功率
+        double dyn_avg_power_mW = tg_avg_power_mW - idle_avg_mW;
+
+        // 动态能量
+        double dyn_energy_mJ = dyn_avg_power_mW * tg_time_s_total;
 
         double avgSteadyLat  = mean(steady_lats);
         double avgTotalLat   = mean(total_lats);
@@ -451,8 +483,9 @@ static void run_static_for_algo(const std::string &      algo_flag,
         double avgSteadyTps  = mean(steady_tps);
 
         std::cout << "[WINDOW " << w << "] cfg=(" << curFreqKHz << " kHz, n=" << curThreads << "), "
-                  << "windowEnergy=" << window_mJ << " mJ"
-                  << ", fixedEnergy=" << fixed_mJ << " mJ"
+                  << "idle_avg_mW=" << idle_avg_mW << ", tg_time_s=" << tg_time_s_total
+                  << ", tg_energy_mJ=" << tg_energy_mJ_total << ", tg_avg_power_mW=" << tg_avg_power_mW
+                  << ", dyn_avg_power_mW=" << dyn_avg_power_mW << ", dyn_energy_mJ=" << dyn_energy_mJ
                   << ", avg_steady_lat=" << avgSteadyLat << " s/token"
                   << ", avg_total_lat=" << avgTotalLat << " s"
                   << ", avg_FTL=" << avgFtl << " s"
@@ -466,7 +499,7 @@ static void run_static_for_algo(const std::string &      algo_flag,
 
         if (optimizer && numSamplesUsed > 0) {
             auto tOptStart = std::chrono::steady_clock::now();
-            optimizer->postBatch(window_mJ, steady_lats, maxTempC);
+            optimizer->postBatch(dyn_energy_mJ, steady_lats, maxTempC);
             auto tOptEnd = std::chrono::steady_clock::now();
             optimizerMs  = std::chrono::duration_cast<std::chrono::microseconds>(tOptEnd - tOptStart).count() / 1000.0;
 
@@ -492,14 +525,14 @@ static void run_static_for_algo(const std::string &      algo_flag,
                         << numSamplesUsed << ","                       // samples
                         << startTempC << ","                           // window_start_temp_c
                         << maxTempC << ","                             // window_max_temp_c
-                        << window_mJ << ","                            // avg_energy_mJ (windowEnergy)
-                        << fixed_mJ << ","                             // fixed_energy_mJ (windowEnergy)
-                        << avgSteadyLat << ","                         // avg_steady_lat_s_per_token
-                        << avgTotalLat << ","                          // avg_total_lat_s
-                        << avgFtl << ","                               // avg_ftl_s
-                        << avgOverallTps << ","                        // avg_overall_ts
-                        << avgSteadyTps << ","                         // avg_steady_ts
-                        << optimizerMs                                 // optimizer_time_ms
+                        << idle_avg_mW << "," << tg_time_s_total << "," << tg_energy_mJ_total << "," << tg_avg_power_mW
+                        << "," << dyn_avg_power_mW << "," << dyn_energy_mJ << "," << avgSteadyLat
+                        << ","                   // avg_steady_lat_s_per_token
+                        << avgTotalLat << ","    // avg_total_lat_s
+                        << avgFtl << ","         // avg_ftl_s
+                        << avgOverallTps << ","  // avg_overall_ts
+                        << avgSteadyTps << ","   // avg_steady_ts
+                        << optimizerMs           // optimizer_time_ms
                         << "\n";
             g_windowCsv.flush();
         }
@@ -548,9 +581,9 @@ int main(int argc, char ** argv) {
 
     // -------- 3. 定义频率/线程档位 --------
     std::vector<int> freqLevelsKHz = read_available_freqs(4);
-    if (freqLevelsKHz.size() >= 8) {
-        freqLevelsKHz.erase(freqLevelsKHz.begin(), freqLevelsKHz.end() - 8);
-    }
+    //    if (freqLevelsKHz.size() >= 8) {
+    //        freqLevelsKHz.erase(freqLevelsKHz.begin(), freqLevelsKHz.end() - 8);
+    //    }
     if (freqLevelsKHz.empty()) {
         std::cerr << "[WARN] scaling_available_frequencies empty for policy4, fallback\n";
         freqLevelsKHz = { 844800, 1190400, 1497600, 1785600, 2073600, 2352000 };

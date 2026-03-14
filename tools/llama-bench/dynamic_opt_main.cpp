@@ -103,6 +103,80 @@ static inline std::vector<int> read_available_freqs(int policy) {
     return v;
 }
 
+static std::vector<int> pick_three_freqs_head_mid_tail(const std::vector<int> & freqs) {
+    std::vector<int> out;
+    if (freqs.empty()) {
+        return out;
+    }
+
+    if (freqs.size() <= 3) {
+        return freqs;
+    }
+
+    const size_t first = 0;
+    const size_t last  = freqs.size() - 1;
+    const size_t mid   = freqs.size() / 2;  // 偶数长度时取偏右中间点
+
+    out.push_back(freqs[first]);
+    if (mid != first && mid != last) {
+        out.push_back(freqs[mid]);
+    }
+    if (last != first) {
+        out.push_back(freqs[last]);
+    }
+
+    return out;
+}
+
+static std::vector<int> pick_representative_freqs(const std::vector<int> & freqs, size_t k) {
+    std::vector<int> out;
+    if (freqs.empty() || k == 0) {
+        return out;
+    }
+
+    if (freqs.size() <= k) {
+        return freqs;
+    }
+
+    out.reserve(k);
+
+    // 均匀覆盖 [0, n-1]
+    const size_t n = freqs.size();
+    for (size_t i = 0; i < k; ++i) {
+        size_t idx = (i * (n - 1) + (k - 1) / 2) / (k - 1);  // 近似四舍五入
+        if (out.empty() || freqs[idx] != out.back()) {
+            out.push_back(freqs[idx]);
+        }
+    }
+
+    // 极端情况下若因重复导致数量不足，再补齐
+    for (size_t i = 0; i < n && out.size() < k; ++i) {
+        bool exists = false;
+        for (int f : out) {
+            if (f == freqs[i]) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            out.push_back(freqs[i]);
+        }
+    }
+
+    return out;
+}
+
+static void print_freq_table(const std::vector<int> & freqs, const std::string & tag) {
+    std::cout << "[FREQ] " << tag << " (" << freqs.size() << " levels): ";
+    for (size_t i = 0; i < freqs.size(); ++i) {
+        std::cout << freqs[i];
+        if (i + 1 < freqs.size()) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << std::endl;
+}
+
 // 尝试让 sysfs 节点变成可写：
 // 1）本来就可写 -> 直接返回 true
 // 2）不可写 -> chmod 0664，再检查一次
@@ -565,12 +639,18 @@ int main(int argc, char ** argv) {
     }
 
     // algo_flag：argv[2]；默认 "all" 表示依次跑 grid/linear/neighbor/mab/bayes
-    std::string algo_flag = "all";
+    std::string algo_flag = "grid";
     if (argc > 2) {
         algo_flag = argv[2];
     }
 
-    std::cout << "[MAIN] model_path = " << model_path << ", algo_flag = " << algo_flag << std::endl;
+    std::string freq_mode = "all";
+    if (argc > 3) {
+        freq_mode = argv[3];
+    }
+
+    std::cout << "[MAIN] model_path = " << model_path << ", algo_flag = " << algo_flag << ", freq_mode = " << freq_mode
+              << std::endl;
 
     // -------- 2. 创建 LlamaRunner --------
     const int n_ctx        = 512;
@@ -581,17 +661,26 @@ int main(int argc, char ** argv) {
 
     // -------- 3. 定义频率/线程档位 --------
     std::vector<int> freqLevelsKHz = read_available_freqs(4);
-    //    if (freqLevelsKHz.size() >= 8) {
-    //        freqLevelsKHz.erase(freqLevelsKHz.begin(), freqLevelsKHz.end() - 8);
-    //    }
     if (freqLevelsKHz.empty()) {
         std::cerr << "[WARN] scaling_available_frequencies empty for policy4, fallback\n";
         freqLevelsKHz = { 844800, 1190400, 1497600, 1785600, 2073600, 2352000 };
     }
 
-    std::vector<int> threadLevels       = { 1, 2, 3 };
-    const int        MAX_WINDOWS        = 50;
-    const size_t     SAMPLES_PER_WINDOW = 5;
+    print_freq_table(freqLevelsKHz, "original");
+
+    if (freq_mode == "three") {
+        freqLevelsKHz = pick_three_freqs_head_mid_tail(freqLevelsKHz);
+        print_freq_table(freqLevelsKHz, "trimmed head-mid-tail");
+    } else if (freq_mode == "repr8") {
+        freqLevelsKHz = pick_representative_freqs(freqLevelsKHz, 8);
+        print_freq_table(freqLevelsKHz, "trimmed representative-8");
+    } else {
+        print_freq_table(freqLevelsKHz, "use all");
+    }
+
+    std::vector<int> threadLevels       = { 1,2,3 };
+    const int        MAX_WINDOWS        = 30;
+    const size_t     SAMPLES_PER_WINDOW = 3;
     const double     alpha              = 0.5;
 
     // -------- 4. 创建功耗采样器 --------
@@ -603,7 +692,7 @@ int main(int argc, char ** argv) {
     );
 
     // -------- 5. 打开 CSV --------
-    ensure_window_csv_opened("/data/local/tmp/cpp/window_metrics.csv");
+    ensure_window_csv_opened("/data/local/tmp/cpp/cpu_mask_metrics_0x70.csv");
 
     // 启动采样线程（多轮算法复用一个 sampler）
     sampler.start();
